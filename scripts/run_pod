@@ -9,7 +9,7 @@ INOPT="-i"
 
 # first, get the freaking json
 ORIGINAL_JSON=$(kubectl run --restart Never --dry-run=client -o json "$@")
-MODIFIED_JSON=$(echo $ORIGINAL_JSON | jq '.spec.containers[] += {volumeMounts: [ {name: "nfs", mountPath: "'"$SHARED_PATH"'"} ], stdin: true, tty: '$TTY'}' | jq '.spec += {volumes: [ {name: "nfs", persistentVolumeClaim: { claimName: "nfs" } } ], imagePullSecrets: [ { name: "docker-secret" } ] }')
+MODIFIED_JSON=$(echo $ORIGINAL_JSON | jq '.spec.containers[] += {volumeMounts: [ {name: "nfs", mountPath: "'"$SHARED_PATH"'"} ], stdin: true, tty: '$TTY'}' | jq '.spec += {volumes: [ {name: "nfs", persistentVolumeClaim: { claimName: "nfs" } } ]}')
 
 # now launch!
-exec kubectl run --pod-running-timeout=999h --restart=Never $INOPT --rm --overrides="$MODIFIED_JSON" "$@"
+exec kubectl run --pod-running-timeout=9h --restart=Never $INOPT --rm --overrides="$MODIFIED_JSON" "$@"

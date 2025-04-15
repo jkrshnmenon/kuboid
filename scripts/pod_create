@@ -3,7 +3,7 @@
 function usage
 {
 	cat <<END
-Usage: $0 [-c CPU_REQUEST] [-C CPU_LIMIT] [-m MEMORY_REQUEST] [-M MEMORY_LIMIT] [-i IMAGE] [ -l LOGDIR ] [ -n POD_NAME ] [ -w WORKDIR ] [ -p POD_PREFIX ] COMMAND
+Usage: $0 [-c CPU_REQUEST] [-C CPU_LIMIT] [-m MEMORY_REQUEST] [-M MEMORY_LIMIT] [-v VOLUME] [-i IMAGE] [-e ENV=VAL] [ -l LOGDIR ] [ -n POD_NAME ] [ -w WORKDIR ] [ -p POD_PREFIX ] [ -s SECRET ] [ -a ANNOTATION=VAL ] COMMAND
 Options:
 	-c CPU_REQUEST		The kubernetes CPU request. Default: 900m (90% of one core, to
 				allow some room for omnipresent tiny kube services)
@@ -12,19 +12,21 @@ Options:
 	-m MEMORY_REQUEST	The kubernetes memory request. Default: 2Gi (2048 megabytes)
 	-M MEMORY_LIMIT		The kubernetes memory limit. Default: 4Gi (4096 megabytes)
 	-N 			Don't mount an NFS share in /shared.
-	-P 			Make the pod privileged (unless your credentials forbid it).
 	-i IMAGE		The Docker image to pull.
+	-e ENV=VAL		An environment variable that needs to be set.
+				Will be updated to accomodate multiple variables.
 	-l LOGDIR		A directory to check for completion logs of pods. If a log is found
 				for a pod, the pod will not be created. Eases re-running missing
 				parts of large experiments.
-	-s SCHEDULED_LIST	A file containing a list of scheduled pods, to avoid trying to
-				re-create a scheduled pod.
 	-n POD_NAME		The name of the pod. If not provided, this will be automatically
 				generated from the given command.
 	-w WORKDIR		A temporary directory to create the yml files describing the pods.
 				If not specified, /tmp/workbench will be used.
 	-p POD_PREFIX		A string to prefix the pod names. Makes mass-scheduling different
 				parts of an experiment easier.
+	-s SECRET		Set this variable if pulling image from a private registry
+	-a ANNOTATION=VAL	Any annotation that needs to be set for this pod.
+				Can be used to identify
 	COMMAND			The command to run in the dockerfile.
 
 All options can also be specified via environment variables (i.e.: POD_PREFIX=mypods ./pod_create echo hello).
@@ -32,20 +34,22 @@ END
 }
 
 LOGDIR=${LOGDIR-}
-SCHEDULED_LIST=${SCHEDULED_LIST-}
 NFS=${NFS-}
 IMAGE=${IMAGE-ubuntu}
+ENV_ARRAY=()
 CPU_REQUEST=${CPU_REQUEST:-900m}
 CPU_LIMIT=${CPU_LIMIT:-1000m}
 MEMORY_REQUEST=${MEMORY_REQUEST:-2Gi}
 MEMORY_LIMIT=${MEMORY_LIMIT:-4Gi}
 POD_NAME=${POD_NAME-}
 POD_PREFIX=${POD_PREFIX-}
+SECRET=${SECRET-}
 WORKDIR=${WORKDIR-}
 NONFS=${NONFS:-0}
-PRIVILEGED=false
+ANN_NAME=${ANN_NAME-}
+ANN_VAL=${ANN_VAL-}
 
-while getopts "c:C:m:M:l:n:i:w:p:s:NP" OPT
+while getopts "c:C:m:M:l:n:i:e:a:s:w:p:N" OPT
 do
 	case $OPT in
 		c)
@@ -63,14 +67,14 @@ do
 		i)
 			IMAGE=$OPTARG
 			;;
+		e)
+			ENV_ARRAY+=($OPTARG)
+			;;
 		l)
 			LOGDIR=$OPTARG
 			;;
 		N)
 			NONFS=1
-			;;
-		P)
-			PRIVILEGED=true
 			;;
 		n)
 			POD_NAME=$OPTARG
@@ -78,11 +82,14 @@ do
 		p)
 			POD_PREFIX=$OPTARG
 			;;
-		s)
-			SCHEDULED_LIST=$OPTARG
-			;;
 		w)
 			WORKDIR=$OPTARG
+			;;
+		s)
+			SECRET=$OPTARG
+			;;
+		a)
+			IFS='=' read ANN_NAME ANN_VAL <<< $OPTARG
 			;;
 		*)
 			usage
@@ -97,17 +104,17 @@ mkdir -p $WORKDIR
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 shift $(($OPTIND-1))
 POD_CMD="$@"
-POD_NAME=$($SCRIPT_DIR/name_pod -p "$POD_PREFIX" -n "$POD_NAME" "$@")
 
-if [ -n "$LOGDIR" -a -f $LOGDIR/$POD_NAME ]
+POD_NAME=${POD_NAME:-$POD_CMD}
+POD_NAME=${POD_NAME:-$POD_CMD}
+[ -n "$POD_PREFIX" ] && POD_NAME=$POD_PREFIX-$POD_NAME
+POD_NAME_COPY=$POD_NAME
+POD_NAME=$(echo $POD_NAME | $SCRIPT_DIR/kubesanitize)
+
+
+if [ -n "$LOGDIR" -a -f $LOGDIR/$POD_NAME.log ]
 then
 	echo "[*] Skipping $POD_NAME creation because the completion log is already there."
-	exit
-fi
-
-if [ -n "$SCHEDULED_LIST" ] && grep -q ^$POD_NAME$ $SCHEDULED_LIST
-then
-	echo "[*] Skipping $POD_NAME because it's already scheduled."
 	exit
 fi
 
@@ -119,15 +126,47 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: $POD_NAME
+END
+if [ -n "$ANN_NAME" ]
+then
+	cat <<END >>$PODPATH
+  annotations:
+    $ANN_NAME: "$ANN_VAL"
+END
+fi
+cat <<END >>$PODPATH
 spec:
   containers:
     - name: $POD_NAME
-      command:
-        - "/bin/bash"
-        - "-c"
-        - "$POD_CMD"
       image: $IMAGE
       imagePullPolicy: Always
+      securityContext:
+        privileged: true
+END
+
+if [ -n "$POD_CMD" ]
+then
+	cat <<END >>$PODPATH
+      command: ["$POD_CMD"]
+END
+fi
+
+if [ ${#ENV_ARRAY[@]} -ge 1 ]
+then
+	cat <<END >>$PODPATH
+      env:
+END
+	for item in ${ENV_ARRAY[@]}
+	do
+		IFS='=' read -r ENV_NAME ENV_VAL <<< "$item"
+		cat <<END >>$PODPATH
+        - name: $ENV_NAME
+          value: "$ENV_VAL"
+END
+	done
+fi
+
+cat <<END >>$PODPATH
       stdin: true
       tty: true
       volumeMounts:
@@ -140,11 +179,18 @@ spec:
         requests:
           cpu: $CPU_REQUEST
           memory: $MEMORY_REQUEST
-      securityContext:
-        privileged: $PRIVILEGED
-  restartPolicy: Never
+END
+
+if [ -n "$SECRET" ]
+then
+	cat <<END >>$PODPATH
   imagePullSecrets:
-    - name: docker-secret
+  - name: $SECRET
+END
+fi
+
+cat <<END >>$PODPATH
+  restartPolicy: Never
   volumes:
   - name: shared
 END
@@ -161,4 +207,5 @@ else
 END
 fi
 
+sed -i 's/\r"/"/g' $PODPATH
 kubectl create -f $PODPATH

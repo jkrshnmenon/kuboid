@@ -7,8 +7,8 @@ echo "[*] Shutting down local NFS servers (to free ports)"
 sudo service nfs-kernel-server stop || true
 sudo service rpcbind stop || true
 
-NFS_SERVER=${NFS_SERVER:-$(kubectl describe pv $(kubectl get pv | grep nfs- | head -n1 | awk '{print $1}') | grep Server | awk '{print $2}')}
-NFS_PATH=${NFS_PATH:-$(kubectl describe pv $(kubectl get pv | grep nfs- | head -n1 | awk '{print $1}') | grep Path | awk '{print $2}')}
+NFS_SERVER=${NFS_SERVER:-$(kubectl describe pv $(kubectl get pv | grep arbiter | head -n1 | awk '{print $1}') | grep Server | awk '{print $2}')}
+NFS_PATH=${NFS_PATH:-$(kubectl describe pv $(kubectl get pv | grep arbiter | head -n1 | awk '{print $1}') | grep Path | awk '{print $2}')}
 
 cat <<END >/tmp/nfs_fwd-$$.yml
 apiVersion: v1
@@ -22,6 +22,10 @@ spec:
     - name: nfs
       command: [ "socat", "tcp-listen:2049,fork,reuseaddr", "tcp-connect:$NFS_SERVER:2049" ]
       image: alpine/socat
+      resources:
+        limits:
+          cpu: 1
+          memory: 1Gi
   restartPolicy: OnFailure
 ---
 kind: Service

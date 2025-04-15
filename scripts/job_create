@@ -1,0 +1,168 @@
+#!/bin/bash -eu
+
+function usage
+{
+	cat <<END
+Usage: $0 [-c CPU_REQUEST] [-C CPU_LIMIT] [-m MEMORY_REQUEST] [-M MEMORY_LIMIT] [-i IMAGE] [ -l LOGDIR ] [ -n JOB_NAME ] [ -w WORKDIR ] [ -p JOB_PREFIX ] COMMAND
+Options:
+	-c CPU_REQUEST		The kubernetes CPU request. Default: 900m (90% of one core, to
+				allow some room for omnipresent tiny kube services)
+	-C CPU_LIMIT		The kubernetes CPU limit. Default: 1000m (100% of one core, to
+				cap the resources consumed by the pod at one core)
+	-m MEMORY_REQUEST	The kubernetes memory request. Default: 2Gi (2048 megabytes)
+	-M MEMORY_LIMIT		The kubernetes memory limit. Default: 4Gi (4096 megabytes)
+	-N 			Don't mount an NFS share in /shared.
+	-P 			Make the pod privileged (unless your credentials forbid it).
+	-i IMAGE		The Docker image to pull.
+	-l LOGDIR		A directory to check for completion logs of pods. If a log is found
+				for a pod, the pod will not be created. Eases re-running missing
+				parts of large experiments.
+	-s SCHEDULED_LIST	A file containing a list of scheduled pods, to avoid trying to
+				re-create a scheduled pod.
+	-n JOB_NAME		The name of the pod. If not provided, this will be automatically
+				generated from the given command.
+	-w WORKDIR		A temporary directory to create the yml files describing the pods.
+				If not specified, /tmp/workbench will be used.
+	-p JOB_PREFIX		A string to prefix the pod names. Makes mass-scheduling different
+				parts of an experiment easier.
+	COMMAND			The command to run in the dockerfile.
+
+All options can also be specified via environment variables (i.e.: JOB_PREFIX=mypods ./pod_create echo hello).
+END
+}
+
+LOGDIR=${LOGDIR-}
+SCHEDULED_LIST=${SCHEDULED_LIST-}
+NFS=${NFS-}
+IMAGE=${IMAGE-ubuntu}
+CPU_REQUEST=${CPU_REQUEST:-900m}
+CPU_LIMIT=${CPU_LIMIT:-1000m}
+MEMORY_REQUEST=${MEMORY_REQUEST:-2Gi}
+MEMORY_LIMIT=${MEMORY_LIMIT:-4Gi}
+JOB_NAME=${JOB_NAME-}
+JOB_PREFIX=${JOB_PREFIX-}
+WORKDIR=${WORKDIR-}
+NONFS=${NONFS:-0}
+PRIVILEGED=false
+NUM_PODS=${NUM_PODS:-1}
+ENV_NAME=${ENV_NAME-}
+ENV_VAL=${ENV_VAL-}
+
+while getopts "c:C:m:M:l:n:i:e:j:J:w:p:s:NP" OPT
+do
+	case $OPT in
+		c)
+			CPU_REQUEST=$OPTARG
+			;;
+		C)
+			CPU_LIMIT=$OPTARG
+			;;
+		m)
+			MEMORY_REQUEST=$OPTARG
+			;;
+		M)
+			MEMORY_LIMIT=$OPTARG
+			;;
+		e)
+			IFS='=' read ENV_NAME ENV_VAL <<< $OPTARG
+			;;
+		i)
+			IMAGE=$OPTARG
+			;;
+		j)
+			NUM_JOBS=$OPTARG
+			;;
+		J)
+			NUM_PODS=$OPTARG
+			;;
+		l)
+			LOGDIR=$OPTARG
+			;;
+		N)
+			NONFS=1
+			;;
+		P)
+			PRIVILEGED=true
+			;;
+		n)
+			JOB_NAME=$OPTARG
+			;;
+		p)
+			JOB_PREFIX=$OPTARG
+			;;
+		s)
+			SCHEDULED_LIST=$OPTARG
+			;;
+		w)
+			WORKDIR=$OPTARG
+			;;
+		*)
+			usage
+			exit 0
+			;;
+	esac
+done
+
+WORKDIR=${WORKDIR:-/tmp/workbench}
+mkdir -p $WORKDIR
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+shift $(($OPTIND-1))
+JOB_CMD="$@"
+JOB_NAME=$($SCRIPT_DIR/name_pod -p "$JOB_PREFIX" -n "$JOB_NAME" "$@")
+
+if [ -n "$LOGDIR" -a -f $LOGDIR/$JOB_NAME ]
+then
+	echo "[*] Skipping $JOB_NAME creation because the completion log is already there."
+	exit
+fi
+
+if [ -n "$SCHEDULED_LIST" ] && grep -q ^$JOB_NAME$ $SCHEDULED_LIST
+then
+	echo "[*] Skipping $JOB_NAME because it's already scheduled."
+	exit
+fi
+
+mkdir -p $WORKDIR/pods
+PODPATH=$WORKDIR/pods/$JOB_NAME.yml
+
+cat <<END >$PODPATH
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: $JOB_NAME
+spec:
+  completions: $NUM_JOBS
+  parallelism: $NUM_PODS
+  completionMode: Indexed
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: $JOB_NAME-worker
+        image: $IMAGE
+        imagePullPolicy: Always
+        env:
+          - name: $ENV_NAME
+            value: "$ENV_VAL"
+        stdin: true
+        tty: true
+        volumeMounts:
+        - name: nfs-shared
+          mountPath: "/shared"
+        resources:
+          limits:
+            cpu: $CPU_LIMIT
+            memory: $MEMORY_LIMIT
+          requests:
+            cpu: $CPU_REQUEST
+            memory: $MEMORY_REQUEST
+      imagePullSecrets:
+        - name: regcred
+      volumes:
+        - name: nfs-shared
+          persistentVolumeClaim:
+            claimName: nfs
+END
+
+# kubectl create -f $PODPATH
